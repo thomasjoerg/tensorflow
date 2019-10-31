@@ -16,7 +16,7 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_XLA_SERVICE_GPU_MULTI_OUTPUT_FUSION_H_
 #define TENSORFLOW_COMPILER_XLA_SERVICE_GPU_MULTI_OUTPUT_FUSION_H_
 
-#include "third_party/tensorflow/compiler/xla/service/multi_output_fusion.h"
+#include "tensorflow/compiler/xla/service/multi_output_fusion.h"
 
 namespace xla {
 namespace gpu {

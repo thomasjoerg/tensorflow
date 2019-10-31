@@ -20,17 +20,17 @@ limitations under the License.
 #include <memory>
 #include <vector>
 
-#include "third_party/absl/algorithm/container.h"
-#include "third_party/absl/container/flat_hash_set.h"
-#include "third_party/tensorflow/compiler/xla/layout_util.h"
-#include "third_party/tensorflow/compiler/xla/service/gpu/gpu_fusible.h"
-#include "third_party/tensorflow/compiler/xla/service/gpu/instruction_fusion.h"
-#include "third_party/tensorflow/compiler/xla/service/gpu/ir_emission_utils.h"
-#include "third_party/tensorflow/compiler/xla/service/hlo_instruction.h"
-#include "third_party/tensorflow/compiler/xla/service/hlo_opcode.h"
-#include "third_party/tensorflow/compiler/xla/service/hlo_reachability.h"
-#include "third_party/tensorflow/compiler/xla/shape_util.h"
-#include "third_party/tensorflow/core/platform/types.h"
+#include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_set.h"
+#include "tensorflow/compiler/xla/layout_util.h"
+#include "tensorflow/compiler/xla/service/gpu/gpu_fusible.h"
+#include "tensorflow/compiler/xla/service/gpu/instruction_fusion.h"
+#include "tensorflow/compiler/xla/service/gpu/ir_emission_utils.h"
+#include "tensorflow/compiler/xla/service/hlo_instruction.h"
+#include "tensorflow/compiler/xla/service/hlo_opcode.h"
+#include "tensorflow/compiler/xla/service/hlo_reachability.h"
+#include "tensorflow/compiler/xla/shape_util.h"
+#include "tensorflow/core/platform/types.h"
 
 namespace xla {
 namespace gpu {
