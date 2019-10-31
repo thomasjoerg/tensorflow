@@ -13,63 +13,42 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "tensorflow/compiler/xla/service/gpu/multi_output_fusion.h"
+#include "third_party/tensorflow/compiler/xla/service/gpu/multi_output_fusion.h"
 
 #include <stdint.h>
 
 #include <memory>
 #include <vector>
 
-#include "absl/algorithm/container.h"
-#include "absl/container/flat_hash_set.h"
-#include "tensorflow/compiler/xla/layout_util.h"
-#include "tensorflow/compiler/xla/service/gpu/gpu_fusible.h"
-#include "tensorflow/compiler/xla/service/gpu/instruction_fusion.h"
-#include "tensorflow/compiler/xla/service/gpu/ir_emission_utils.h"
-#include "tensorflow/compiler/xla/service/hlo_instruction.h"
-#include "tensorflow/compiler/xla/service/hlo_opcode.h"
-#include "tensorflow/compiler/xla/service/hlo_reachability.h"
-#include "tensorflow/compiler/xla/shape_util.h"
-#include "tensorflow/core/platform/types.h"
+#include "third_party/absl/algorithm/container.h"
+#include "third_party/absl/container/flat_hash_set.h"
+#include "third_party/tensorflow/compiler/xla/layout_util.h"
+#include "third_party/tensorflow/compiler/xla/service/gpu/gpu_fusible.h"
+#include "third_party/tensorflow/compiler/xla/service/gpu/instruction_fusion.h"
+#include "third_party/tensorflow/compiler/xla/service/gpu/ir_emission_utils.h"
+#include "third_party/tensorflow/compiler/xla/service/hlo_instruction.h"
+#include "third_party/tensorflow/compiler/xla/service/hlo_opcode.h"
+#include "third_party/tensorflow/compiler/xla/service/hlo_reachability.h"
+#include "third_party/tensorflow/compiler/xla/shape_util.h"
+#include "third_party/tensorflow/core/platform/types.h"
 
 namespace xla {
 namespace gpu {
 
-GpuMultiOutputFusion::GpuMultiOutputFusion() {}
+namespace {
 
-bool GpuMultiOutputFusion::ShapesCompatibleForFusion(HloInstruction* instr1,
-                                                     HloInstruction* instr2) {
-  return ShapesCompatibleForMultiOutputFusion(*instr1, *instr2);
-}
-
-bool GpuMultiOutputFusion::IsFusible(HloInstruction* instr) {
-  return IsFusibleAsMultiOutputFusionRoot(*instr);
-}
-
-int64 GpuMultiOutputFusion::GetProfit(HloInstruction* instr1,
-                                      HloInstruction* instr2) {
-  absl::flat_hash_set<HloInstruction*> in_list;
-  for (auto instr : instr1->operands()) {
-    if (IsProfitableOperand(instr)) {
-      in_list.insert(instr);
-    }
-  }
-  int64 profit = 0;
-  for (auto instr : instr2->operands()) {
-    if (IsProfitableOperand(instr) && in_list.contains(instr)) {
-      profit += ShapeUtil::ByteSizeOf(instr->shape());
-    }
-  }
-  VLOG(2) << "Fusing instr1=" << instr1->name() << " instr2=" << instr2->name()
-          << ", the profit is =" << profit;
-  return profit;
-}
-
-bool GpuMultiOutputFusion::LegalToFuse(HloInstruction* instr1,
-                                       HloInstruction* instr2) {
-  if (!MultiOutputFusion::LegalToFuse(instr1, instr2)) {
+bool IsProfitableOperand(HloInstruction* instr) {
+  // kConstant instruction will not have memory reads, so it won't be a profit
+  // source. Skip them.
+  if (instr->opcode() == HloOpcode::kConstant &&
+      ShapeUtil::IsEffectiveScalar(instr->shape())) {
     return false;
   }
+  return true;
+}
+
+
+bool LegalToFuse(HloInstruction* instr1, HloInstruction* instr2) {
   // If we're fusing fusions only do it if the fusion kind matches. Loop fusions
   // merge into bigger loop fusions and input (reduce) fusions become fusions
   // with multiple reduce outputs. We could fuse reduce and loop fusions
@@ -97,8 +76,6 @@ bool GpuMultiOutputFusion::LegalToFuse(HloInstruction* instr1,
   // Do this check last, as it may be expensive.
   return !FusionWouldBeTooLarge(*instr1, *instr2);
 }
-
-namespace {
 
 // We prefer multi-output fusions over other fusions over unfused ops, because
 // we want to preserve fusion opportunities if possible.
@@ -162,13 +139,96 @@ std::vector<HloInstruction*> GetProducerConsumerMultiOutputFusionCandidates(
   return fusion_candidates;
 }
 
+static int fusion_priority(const HloInstruction* instr) {
+  if (instr->IsMultiOutputFusion()) {
+    return 2;
+  }
+  if (instr->opcode() == HloOpcode::kFusion) {
+    return 1;
+  }
+  return 0;
+}
+
+bool IsSiblingFusionCandidate(const HloInstruction* instr) {
+  auto multioutput_user_is_not_gte = [](const HloInstruction* instr) {
+    if (!instr->IsMultiOutputFusion()) {
+      return false;
+    }
+    for (auto user : instr->users()) {
+      if (user->opcode() != HloOpcode::kGetTupleElement) {
+        return true;
+      }
+    }
+    return false;
+  };
+  if (instr->user_count() == 0) {
+    return false;
+  }
+  if (!IsFusibleAsMultiOutputFusionRoot(*instr)) {
+    return false;
+  }
+  if (multioutput_user_is_not_gte(instr)) {
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
-bool GpuMultiOutputFusion::DoProducerConsumerMultiOutputFusion() {
+
+void GpuMultiOutputFusion::RecomputeReachability() {
+  reachability_ = HloReachabilityMap::Build(computation_);
+}
+
+bool GpuMultiOutputFusion::FuseSiblings(HloInstruction* parent) {
+  if (!IsProfitableOperand(parent)) {
+    return false;
+  }
+  bool changed = false;
+  std::vector<HloInstruction*> siblings = parent->users();
+  absl::c_stable_sort(siblings,
+                      [&](const HloInstruction* a, const HloInstruction* b) {
+                        return fusion_priority(a) > fusion_priority(b);
+                      });
+  for (auto i = siblings.begin(); i != siblings.end();) {
+    VLOG(3) << "Considering " << (*i)->name();
+    if ((*i)->opcode() != HloOpcode::kFusion || !IsSiblingFusionCandidate(*i)) {
+      ++i;
+      continue;
+    }
+    for (auto j = i + 1; j != siblings.end();) {
+      VLOG(3) << "Considering " << (*i)->name() << " and " << (*j)->name();
+      if (!IsSiblingFusionCandidate(*j) || reachability_->IsConnected(*i, *j) ||
+          !ShapesCompatibleForMultiOutputFusion(*(*i), *(*j)) ||
+          !LegalToFuse(*i, *j)) {
+        ++j;
+        continue;
+      }
+      VLOG(2) << "Fuse siblings " << (*i)->name() << " and " << (*j)->name();
+      HloInstruction* remaining = *i;
+      HloInstruction* fused = *j;
+      if (fused->opcode() == HloOpcode::kFusion) {
+        remaining->MergeFusionInstructionIntoMultiOutput(fused);
+      } else {
+        remaining->FuseInstructionIntoMultiOutput(fused);
+        CHECK_EQ(0, fused->user_count());
+        TF_CHECK_OK(computation_->RemoveInstruction(fused));
+      }
+      changed = true;
+      siblings.erase(j);
+      RecomputeReachability();
+      // TODO(tjoerg): ConsumeFuel
+    }
+    ++i;
+  }
+  return changed;
+}
+
+bool GpuMultiOutputFusion::DoMultiOutputFusion() {
   bool changed = false;
   RecomputeReachability();
   std::vector<HloInstruction*> defs_before_uses =
-      computation()->MakeInstructionPostOrder();
+      computation_->MakeInstructionPostOrder();
 
   while (!defs_before_uses.empty()) {
     // Traverse the HLO in uses-before-defs order by removing instruction from
@@ -181,8 +241,12 @@ bool GpuMultiOutputFusion::DoProducerConsumerMultiOutputFusion() {
       VLOG(3) << producer->name() << " is a constant.";
       continue;
     }
+    if (FuseSiblings(/*parent=*/producer)) {
+      changed = true;
+    }
+    // Producer-consumer multi-output fusion.
     const auto candidates = GetProducerConsumerMultiOutputFusionCandidates(
-        producer, *reachability());
+        producer, *reachability_);
     auto* consumer_for_fusion = SelectPreferredFusionCandidate(candidates);
     if (consumer_for_fusion == nullptr) {
       continue;
@@ -196,27 +260,38 @@ bool GpuMultiOutputFusion::DoProducerConsumerMultiOutputFusion() {
       } else {
         consumer_for_fusion->FuseInstructionIntoMultiOutput(producer);
         CHECK_EQ(0, producer->user_count());
-        TF_CHECK_OK(computation()->RemoveInstruction(producer));
+        TF_CHECK_OK(computation_->RemoveInstruction(producer));
       }
       RecomputeReachability();
       continue;
     }
     HloInstruction* input_fusion =
-        computation()->AddInstruction(HloInstruction::CreateFusion(
+        computation_->AddInstruction(HloInstruction::CreateFusion(
             consumer_for_fusion->shape(),
             ChooseFusionKind(*producer, *consumer_for_fusion),
             consumer_for_fusion));
     VLOG(2) << "Fuse producer " << producer->name() << " and its consumer "
             << consumer_for_fusion->name() << " into " << input_fusion->name();
-    reachability()->Replace(consumer_for_fusion, input_fusion);
     TF_CHECK_OK(
-        computation()->ReplaceInstruction(consumer_for_fusion, input_fusion));
+        computation_->ReplaceInstruction(consumer_for_fusion, input_fusion));
     if (producer->opcode() == HloOpcode::kFusion) {
       input_fusion->MergeFusionInstructionIntoMultiOutput(producer);
     } else {
       input_fusion->FuseInstructionIntoMultiOutput(producer);
       CHECK_EQ(0, producer->user_count());
-      TF_CHECK_OK(computation()->RemoveInstruction(producer));
+      TF_CHECK_OK(computation_->RemoveInstruction(producer));
+    }
+    RecomputeReachability();
+  }
+  return changed;
+}
+
+StatusOr<bool> GpuMultiOutputFusion::Run(HloModule* module) {
+  bool changed = false;
+  for (auto* computation : module->MakeNonfusionComputations()) {
+    computation_ = computation;
+    if (DoMultiOutputFusion()) {
+      changed = true;
     }
   }
   return changed;
@@ -224,3 +299,4 @@ bool GpuMultiOutputFusion::DoProducerConsumerMultiOutputFusion() {
 
 }  // namespace gpu
 }  // namespace xla
+
